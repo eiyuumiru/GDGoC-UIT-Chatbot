@@ -1,4 +1,25 @@
+# install with arguments: --index-strategy unsafe-best-match
+# for example: uv pip install -r .\requirements.txt --index-strategy unsafe-best-match
+
+--index-url https://download.pytorch.org/whl/cu126
+--extra-index-url https://pypi.org/simple
+
+torch>=2.6
+torchvision
+torchaudio
+
+transformers>=4.44
+safetensors
+
 langchain
 langchain-community
+langchain_groq
+langchain-chroma
+langchain-experimental
+langchain_huggingface
+chromadb
+tqdm
+sentence-transformers
+unstructured
+unstructured[md]
 streamlit
-langchain-groq

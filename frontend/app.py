@@ -1,5 +1,6 @@
 import streamlit as st
 from langchain_groq import ChatGroq
+
 from backend.FullChain import ask_question, create_full_chain
 
 st.set_page_config(page_title="Chat with Document", page_icon=":shark:")
@@ -69,7 +70,7 @@ def run():
     if ready:
         chain = get_chain(groq_api_key=st.session_state["GROQ_API_KEY"])
         st.subheader("Ask me questions about this week's meal plan")
-        show_ui(chain, "Xin chao! Mình có thể giúp gì cho bạn?")
+        show_ui(chain, "Xin chào! Mình có thể giúp gì cho bạn?")
     else:
         st.stop()
 
