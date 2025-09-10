@@ -23,3 +23,6 @@ sentence-transformers
 unstructured
 unstructured[md]
 streamlit
+
+rank_bm25
+einops
