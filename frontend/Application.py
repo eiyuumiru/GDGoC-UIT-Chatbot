@@ -60,12 +60,12 @@ for m in st.session_state["messages"]:
     with st.chat_message(m["role"]):
         st.write(m["content"])
 
-def render_sources(srcs: List[str]):
-    if not srcs:
-        return
-    with st.expander("Nguồn tham khảo (retrieved)"):
-        for s in srcs:
-            st.write(f"- {s}")
+# def render_sources(srcs: List[str]):
+#     if not srcs:
+#         return
+#     with st.expander("Nguồn tham khảo (retrieved)"):
+#         for s in srcs:
+#             st.write(f"- {s}")
 
 prompt = st.chat_input("Đặt câu hỏi của bạn…")
 if prompt:
@@ -75,7 +75,7 @@ if prompt:
     with st.chat_message("assistant"):
         with st.spinner("Đang truy xuất & tổng hợp..."):
             out = qa(prompt)
-            answer = out.get("text", "Không tạo được câu trả lời.")
+            answer = out["messages"][-1].content
             st.markdown(answer)
-            render_sources(out.get("sources", []))
+            # render_sources(out.get("sources", []))
     st.session_state["messages"].append({"role": "assistant", "content": answer})

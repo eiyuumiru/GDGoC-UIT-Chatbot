@@ -8,7 +8,7 @@ from tqdm import tqdm
 def split_markdown(
     docs: List[Document],
     encoder,
-    headers: List[Tuple[str, str]] = (("#","h1"), ("##","h2"), ("###","h3"), ("####","h4")),
+    headers: List[Tuple[str, str]] = (("#","h1"), ("##","h2"), ("###","h3"), ("####","h4")), # type: ignore
     percentile: int = 92,
     enforce_max: int = 850,
     overlap: int = 120,

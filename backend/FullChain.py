@@ -8,7 +8,7 @@ from .Splitters import split_markdown
 from .EmbeddingManager import get_encoder
 from .Vectors import build_index as build_vec, load_index as load_vec
 from .Retriever import docs_from_chroma, make_hybrid_retriever, CrossEncoderReranker
-
+from langchain_core.tools import tool
 
 _DB = None
 _ENC = None
@@ -28,13 +28,25 @@ def _refresh_caches(db=None, enc=None):
 def _ensure_loaded():
     global _DB, _ENC, _CHUNKS_FOR_BM25, _RERANKER
     if _ENC is None:
-        _ENC = get_encoder(batch_size=64)
+        try:
+            _ENC = get_encoder(batch_size=64)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load encoder: {e}")
     if _DB is None:
-        _DB = load_vec(_ENC)
+        try:
+            _DB = load_vec(_ENC)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load vector DB: {e}")
     if _CHUNKS_FOR_BM25 is None:
-        _CHUNKS_FOR_BM25 = docs_from_chroma(_DB)
+        try:
+            _CHUNKS_FOR_BM25 = docs_from_chroma(_DB)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load BM25 chunks: {e}")
     if _RERANKER is None:
-        _RERANKER = CrossEncoderReranker()
+        try:
+            _RERANKER = CrossEncoderReranker()
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize reranker: {e}")
 
 def build_index(
     data_dir: str = "backend/dataset",
@@ -66,24 +78,33 @@ def build_index(
 
 def search(query: str, k: int = 4, mode: str = "dense") -> List[Document]:
     _ensure_loaded()
+    if _CHUNKS_FOR_BM25 is None:
+        raise RuntimeError("BM25 chunks not loaded")
+    if _DB is None:
+        raise RuntimeError("Vector DB not loaded")
     if mode == "hybrid":
         k_init = max(30, k * 4)
-        ret = make_hybrid_retriever(_CHUNKS_FOR_BM25, _DB, k=k_init, weights=(0.65, 0.35))
+        ret = make_hybrid_retriever(_CHUNKS_FOR_BM25, _DB, k=k_init, weights=(0.6, 0.4))
     else:
         ret = _DB.as_retriever(search_kwargs={"k": k})
     return ret.invoke(query)
 
-
-def ask_question(query: str, k: int = 6) -> Dict[str, Any]:
+@tool(response_format='content_and_artifact')
+def ask_question(query: str) -> tuple[str, List[Dict[str, Any]]]:
+    """Retrieve information related to a query."""
     _ensure_loaded()
-
+    k = 6
+    if _CHUNKS_FOR_BM25 is None:
+        raise RuntimeError("BM25 chunks not loaded")
+    if _RERANKER is None:
+        raise RuntimeError("Reranker not initialized")
     k_init = max(60, k * 6)
-    weights = (0.65, 0.35)
+    weights = (0.6, 0.4)
     ret = make_hybrid_retriever(_CHUNKS_FOR_BM25, _DB, k=k_init, weights=weights)
     cand_docs = ret.invoke(query)
 
     ranked = _RERANKER.rerank(query, cand_docs, topn=k)
-
+    
     results = []
     for d, score in ranked:
         results.append({
@@ -91,4 +112,4 @@ def ask_question(query: str, k: int = 6) -> Dict[str, Any]:
             "score": float(score),
             "content": d.page_content
         })
-    return {"query": query, "k": k, "results": results}
+    return query, results

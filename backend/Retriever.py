@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import List, Tuple, Optional
+from typing import List
 from langchain.schema import Document
 from langchain_community.retrievers import BM25Retriever
 from langchain.retrievers import EnsembleRetriever
