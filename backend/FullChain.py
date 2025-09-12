@@ -90,8 +90,8 @@ def search(query: str, k: int = 4, mode: str = "dense") -> List[Document]:
     return ret.invoke(query)
 
 @tool(response_format='content_and_artifact')
-def ask_question(query: str) -> tuple[str, List[Dict[str, Any]]]:
-    """Retrieve information related to a query."""
+def retrieve(query: str) -> tuple[str, List[Dict[str, Any]]]:
+    """Retrieve information about UIT's academic curriculum (majors, courses, credits, and regulations) from the internal vector database."""
     _ensure_loaded()
     k = 6
     if _CHUNKS_FOR_BM25 is None:
@@ -99,7 +99,7 @@ def ask_question(query: str) -> tuple[str, List[Dict[str, Any]]]:
     if _RERANKER is None:
         raise RuntimeError("Reranker not initialized")
     k_init = max(60, k * 6)
-    weights = (0.6, 0.4)
+    weights = (0.3, 0.7)
     ret = make_hybrid_retriever(_CHUNKS_FOR_BM25, _DB, k=k_init, weights=weights)
     cand_docs = ret.invoke(query)
 

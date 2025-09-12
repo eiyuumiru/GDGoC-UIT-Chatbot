@@ -5,8 +5,10 @@ from langchain_groq import ChatGroq
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.constants import END
 from langgraph.graph import MessagesState, StateGraph
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.runnables import RunnableConfig
 from langchain_core.messages import SystemMessage, HumanMessage
-from .FullChain import ask_question, _ensure_loaded
+from .FullChain import retrieve, _ensure_loaded
 
 
 graph_builder = StateGraph(MessagesState)
@@ -110,20 +112,29 @@ def create_rag_chain(
     max_ctx_chars: int = 8000,
 ) -> Callable[[str], Dict[str, Any]]:
     _ensure_loaded()
-    llm = get_groq_llm(groq_api_key, model=model, temperature=temperature)
+    llm = get_groq_llm(groq_api_key, model=model, temperature=temperature, max_tokens=7000)
 
     def query_or_response(state: MessagesState):
-        llm_with_tools = llm.bind_tools([ask_question])
-        response = llm_with_tools.invoke(state['messages'])
+        """Generate tool call for retrieval or respond."""
+        SYSTEM_PROMPT = SystemMessage(content = (
+            "Bạn là một trợ lý thông minh. "
+            "Chỉ sử dụng công cụ truy vấn (retrieval tool) nếu người dùng hỏi về "
+            "chương trình đào tạo, khóa học, hoặc thông tin liên quan đến UIT. "
+            "Nếu câu hỏi mang tính xã giao (ví dụ: chào hỏi) hoặc không liên quan "
+            "đến UIT, hãy trả lời trực tiếp mà không gọi công cụ."
+        ))
+        llm_with_tools = llm.bind_tools([retrieve])
+        response = llm_with_tools.invoke([SYSTEM_PROMPT] + state['messages'])
         return {"messages": [response]}
 
     def generate_with_context(state: MessagesState):
+        """Generate answer."""
         messages = build_prompt(state)
         out = llm.invoke(messages)
         return {"messages": [out]}
 
     # ToolNode chỉ nhận tool thật sự
-    tools = ToolNode([ask_question])
+    tools = ToolNode([retrieve])
 
     # Build graph
     graph_builder.add_node(query_or_response)
@@ -138,13 +149,19 @@ def create_rag_chain(
     )
     graph_builder.add_edge("tools", "generate_with_context")
     graph_builder.add_edge("generate_with_context", END)
-
     graph = graph_builder.compile()
 
     def qa(question: str, topk: Optional[int] = None) -> Dict[str, Any]:
-        for step in graph.stream({"messages": [HumanMessage(content=question)]}):
-            print("---- Step ----")
-            print(step)
-        return graph.invoke({"messages": [HumanMessage(content=question)]})
+        result = graph.invoke({"messages": [HumanMessage(content=question)]})
+        print(f"\n❓ Câu hỏi: {question}")
+        for m in result.get("messages", []):
+            if hasattr(m, "type") and m.type == "ai":
+                if getattr(m, "tool_calls", None):
+                    print("🤖 Model chọn → TOOL CALL")
+                else:
+                    print("🤖 Model chọn → TRẢ LỜI TRỰC TIẾP")
+            elif hasattr(m, "type") and m.type == "tool":
+                print("🛠️ Tool output:", getattr(m, "content", None))
+        return result
 
     return qa
