@@ -6,7 +6,7 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.constants import END, START
 from langgraph.graph import MessagesState, StateGraph
 from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, FewShotChatMessagePromptTemplate
 from .FullChain import retrieve, _ensure_loaded, ContextFormatter
 
 def get_groq_llm(
@@ -33,9 +33,48 @@ SYSTEM_INSTRUCTIONS = (
     "• Không đề cập đến quy trình nội bộ, công cụ hay cách bạn có dữ liệu.\n"
 )
 
+ANSWER_EXAMPLES = [
+    {
+        "input": "Môn IT007 bao nhiêu tín chỉ?",
+        "context": "- IT007 | Hệ điều hành | 4 | 3 | 1",
+        "output": "IT007 có 4 tín chỉ."
+    },
+    {
+        "input": "Tên môn DS101 là gì?",
+        "context": "- DS101 | Thống kê và xác suất chuyên sâu | …",
+        "output": "DS101 là \"Thống kê và xác suất chuyên sâu\"."
+    },
+    {
+        "input": "Môn CS116 học về gì?",
+        "context": "- CS116 | Lập trình Python cho Máy học | Môn học cung cấp kiến thức và kỹ năng lập trình Python áp dụng cho bài toán machine learning.",
+        "output": "CS116 (Lập trình Python cho Máy học) cung cấp kiến thức và kỹ năng Python cho các bài toán máy học."
+    },
+    {
+        "input": "So sánh số tín chỉ giữa CS115 và CS116.",
+        "context": "- CS115 | Toán cho Khoa học máy tính | 4 | 4 | 0\n- CS116 | Lập trình Python cho Máy học | 4 | 3 | 1",
+        "output": "- CS115: 4 tín chỉ\n- CS116: 4 tín chỉ"
+    },
+    {
+        "input": "Mã môn của \"Hệ điều hành\" là gì?",
+        "context": "- IT007 | Hệ điều hành | …",
+        "output": "Mã môn của \"Hệ điều hành\" là IT007."
+    },
+]
+
+EXAMPLE_PROMPT = ChatPromptTemplate.from_messages([
+    ("human", "Câu hỏi (ví dụ): {input}\n\nDữ liệu tham chiếu (ví dụ):\n{context}"),
+    ("ai", "{output}")
+])
+
+FEW_SHOT = FewShotChatMessagePromptTemplate(
+    examples=ANSWER_EXAMPLES,
+    example_prompt=EXAMPLE_PROMPT,
+)
+
 ANSWER_PROMPT = ChatPromptTemplate.from_messages(
     [
         ("system", SYSTEM_INSTRUCTIONS),
+        FEW_SHOT,
         (
             "human",
             "Câu hỏi: {question}\n\n"
@@ -97,9 +136,7 @@ def create_rag_chain(
     context_formatter = ContextFormatter(max_chars=max_ctx_chars, max_items=k)
 
     def query_or_response(state: MessagesState):
-        """
-        Node 1: Cho phép LLM quyết định có cần tool.
-        """
+        """Node 1: Cho phép LLM quyết định có cần tool."""
         planner_system = SystemMessage(
             content=(
                 "Bạn là một trợ lý thông minh cho CTĐT UIT. "
@@ -112,13 +149,9 @@ def create_rag_chain(
         return {"messages": [response]}
 
     def generate_with_context(state: MessagesState):
-        """
-        Node 2: Sau khi (có thể) đã gọi tool, tổng hợp trả lời bằng PromptTemplate.
-        KHÔNG nhắc đến trích dẫn/nguồn, KHÔNG hiển thị source.
-        """
+        """Node 2: Sau khi (có thể) đã gọi tool, tổng hợp trả lời bằng PromptTemplate."""
         chunks = _collect_tool_chunks_from_state(state)
         contexts = context_formatter.format_context(chunks)
-        print(contexts)  # Debug
         question = _get_last_user_question(state)
         messages = ANSWER_PROMPT.format_messages(question=question, contexts=contexts)
         out = llm_answer.invoke(messages)
