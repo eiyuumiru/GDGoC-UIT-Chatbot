@@ -1,16 +1,14 @@
 from __future__ import annotations
+import re
 from typing import Callable, List, Dict, Any, Optional
 import os
-
 from langchain_groq import ChatGroq
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.constants import END, START
 from langgraph.graph import MessagesState, StateGraph
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
-
-from .FullChain import retrieve, _ensure_loaded
-
+from .FullChain import retrieve, _ensure_loaded, ContextFormatter
 
 def get_groq_llm(
     groq_api_key: Optional[str] = None,
@@ -41,7 +39,7 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages(
     [
         ("system", SYSTEM_INSTRUCTIONS),
         (
-            "user",
+            "human",
             "Câu hỏi: {question}\n\n"
             "Dữ liệu tham chiếu (có thể trống):\n"
             "----------------\n"
@@ -75,28 +73,11 @@ def _collect_tool_chunks_from_state(state: MessagesState) -> List[Dict[str, Any]
     return chunks
 
 
-def _format_context_plain(chunks: List[Dict[str, Any]], max_chars: int = 8000, max_items: int = 6) -> str:
-    """
-    Biến danh sách chunk thành một khối văn bản phẳng, không chứa CTX id/source.
-    """
-    buf, total = [], 0
-    for c in chunks[:max_items]:
-        piece = (c.get("content") or "").strip()
-        if not piece:
-            continue
-        if total + len(piece) > max_chars:
-            break
-        buf.append(piece)
-        total += len(piece)
-    return "\n\n".join(buf)
-
-
 def _get_last_user_question(state: MessagesState) -> str:
     for m in reversed(state["messages"]):
         if m.type == "human":
             return str(m.content or "")
     return ""
-
 
 def create_rag_chain(
     groq_api_key: Optional[str],
@@ -116,6 +97,8 @@ def create_rag_chain(
     llm_answer = get_groq_llm(
         groq_api_key, model=model, temperature=temperature, max_tokens=7000
     )
+
+    context_formatter = ContextFormatter(max_chars=max_ctx_chars, max_items=k)
 
     def query_or_response(state: MessagesState):
         """
@@ -138,7 +121,8 @@ def create_rag_chain(
         KHÔNG nhắc đến trích dẫn/nguồn, KHÔNG hiển thị source.
         """
         chunks = _collect_tool_chunks_from_state(state)
-        contexts = _format_context_plain(chunks, max_chars=max_ctx_chars)
+        contexts = context_formatter.format_context(chunks)
+        print(contexts)  # Debug
         question = _get_last_user_question(state)
         messages = ANSWER_PROMPT.format_messages(question=question, contexts=contexts)
         out = llm_answer.invoke(messages)
@@ -159,15 +143,6 @@ def create_rag_chain(
 
     def qa(question: str, topk: Optional[int] = None) -> Dict[str, Any]:
         result = graph.invoke({"messages": [HumanMessage(content=question)]})
-        try:
-            print(f"\n❓ Câu hỏi: {question}")
-            for m in result.get("messages", []):
-                if getattr(m, "type", None) == "ai":
-                    print("🤖 Trả lời:", getattr(m, "content", ""))
-                elif getattr(m, "type", None) == "tool":
-                    print("🛠️ Tool output:", str(getattr(m, "content", "")))
-        except Exception:
-            pass
         return result
 
     return qa
