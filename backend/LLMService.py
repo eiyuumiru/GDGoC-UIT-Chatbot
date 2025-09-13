@@ -3,11 +3,10 @@ from typing import Callable, List, Dict, Any, Optional
 import os
 from langchain_groq import ChatGroq
 from langgraph.prebuilt import ToolNode, tools_condition
-from langgraph.constants import END
+from langgraph.constants import END, START
 from langgraph.graph import MessagesState, StateGraph
-from langgraph.checkpoint.memory import MemorySaver
-from langchain_core.runnables import RunnableConfig
 from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.prompts import ChatPromptTemplate
 from .FullChain import retrieve, _ensure_loaded
 
 
@@ -19,6 +18,7 @@ SYSTEM_INSTRUCTIONS = (
     "'không có trong dữ liệu'. Trả lời ngắn gọn, chính xác, tiếng Việt. "
     "Khi có số liệu hoặc quy định, nêu rõ. "
     "Cuối cùng phải có mục 'Nguồn:' liệt kê các nguồn đã dùng theo thứ tự xuất hiện."
+
 )
 
 
@@ -137,16 +137,17 @@ def create_rag_chain(
     tools = ToolNode([retrieve])
 
     # Build graph
-    graph_builder.add_node(query_or_response)
-    graph_builder.add_node(tools)
-    graph_builder.add_node(generate_with_context)
+    graph_builder.add_node("query_or_response",query_or_response)
+    graph_builder.add_node("tools", tools)
+    graph_builder.add_node("generate_with_context", generate_with_context)
 
-    graph_builder.set_entry_point("query_or_response")
     graph_builder.add_conditional_edges(
         "query_or_response",
         tools_condition,
         {END: END, "tools": "tools"},
     )
+    graph_builder.set_entry_point("query_or_response")
+    graph_builder.add_edge(START, "query_or_response")
     graph_builder.add_edge("tools", "generate_with_context")
     graph_builder.add_edge("generate_with_context", END)
     graph = graph_builder.compile()
