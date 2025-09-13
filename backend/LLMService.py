@@ -1,5 +1,4 @@
 from __future__ import annotations
-import re
 from typing import Callable, List, Dict, Any, Optional
 import os
 from langchain_groq import ChatGroq
@@ -24,7 +23,6 @@ def get_groq_llm(
         temperature=temperature,
         max_tokens=max_tokens,
     )
-
 
 SYSTEM_INSTRUCTIONS = (
     "Bạn là trợ lý trả lời về Chương Trình Đào Tạo UIT (Khóa 2025).\n"
@@ -51,7 +49,6 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages(
     ]
 )
 
-
 def _collect_tool_chunks_from_state(state: MessagesState) -> List[Dict[str, Any]]:
     """Lấy artifact từ các ToolMessage gần nhất (nếu có)."""
     recent_tool_messages = []
@@ -71,7 +68,6 @@ def _collect_tool_chunks_from_state(state: MessagesState) -> List[Dict[str, Any]
                     if content:
                         chunks.append({"content": content})
     return chunks
-
 
 def _get_last_user_question(state: MessagesState) -> str:
     for m in reversed(state["messages"]):
