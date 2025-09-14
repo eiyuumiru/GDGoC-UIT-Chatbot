@@ -1,32 +1,21 @@
 from __future__ import annotations
 from typing import Dict, Any, Optional, List
 import os, math, time, json
-from pydantic import BaseModel
 from langchain_groq import ChatGroq
-from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.constants import END, START
 from langgraph.graph import MessagesState, StateGraph
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_community.chat_message_histories import ChatMessageHistory
+from langgraph.prebuilt import ToolNode
 from langmem import create_memory_manager
 from .FullChain import retrieve, _ensure_loaded, ContextFormatter
 from .EmbeddingManager import get_encoder
 
-class UserProfile(BaseModel):
-    name: Optional[str] = None
-    language: Optional[str] = None
-    timezone: Optional[str] = None
-    tone: Optional[str] = None
-    detail_level: Optional[str] = None
-    expertise: Optional[str] = None
-    presentation: Optional[str] = None
-
 _HIST: Dict[str, ChatMessageHistory] = {}
 _SEM: Dict[str, List[Dict[str, Any]]] = {}
-_PROFILE: Dict[str, UserProfile] = {}
 _EMB = None
 
 def _get_hist(session_id: str) -> BaseChatMessageHistory:
@@ -60,146 +49,89 @@ def _cos(a, b):
 def _sem_add(session_id: str, texts: List[str]):
     if not texts:
         return
-    enc = _ensure_emb()
-    vecs_raw = enc.embed_documents(texts)
-    vecs = [_vec(v) for v in vecs_raw]
+    vecs = [_vec(v) for v in _ensure_emb().embed_documents(texts)]
     bucket = _SEM.setdefault(session_id, [])
     ts = time.time()
     for t, v in zip(texts, vecs):
         bucket.append({"t": t, "v": v, "ts": ts})
 
-def _sem_recall(session_id: str, query: str, k: int = 6, max_chars: int = 800):
+def _sem_recall(session_id: str, query: str, k: int = 5, max_chars: int = 600):
     items = _SEM.get(session_id, [])
     if not items or not query.strip():
         return ""
-    enc = _ensure_emb()
-    qv = _vec(enc.embed_query(query))
-    scored = [(it["t"], _cos(qv, it["v"])) for it in items]
-    scored.sort(key=lambda x: x[1], reverse=True)
-    s, acc = [], 0
+    qv = _vec(_ensure_emb().embed_query(query))
+    scored = sorted(((it["t"], _cos(qv, it["v"])) for it in items), key=lambda x: x[1], reverse=True)
+    out, acc = [], 0
     for t, _ in scored[: max(1, k)]:
         if acc + len(t) > max_chars:
             break
-        s.append(t)
+        out.append(t)
         acc += len(t)
-    return "\n".join(s)
+    return "\n".join(out)
 
-def _profile_text(p: Optional[UserProfile]) -> str:
-    if not p:
-        return ""
-    d = json.loads(p.model_dump_json(exclude_none=True))
-    if not d:
-        return ""
-    return "\n".join(f"{k}: {v}" for k, v in d.items())
+def _trim_hist(session_id: str, max_messages: int = 10):
+    h = _get_hist(session_id)
+    msgs = getattr(h, "messages", [])
+    if len(msgs) > max_messages:
+        h.messages = msgs[-max_messages:]
 
-def get_groq_llm(groq_api_key: Optional[str] = None, model: str = "llama-3.3-70b-versatile", temperature: float = 0.2, max_tokens: Optional[int] = None) -> ChatGroq:
-    key = groq_api_key or os.getenv("GROQ_API_KEY")
-    if not key:
+def get_groq_llm(key: Optional[str] = None, model: str = "llama-3.3-70b-versatile", temperature: float = 0.2, max_tokens: Optional[int] = None) -> ChatGroq:
+    k = key or os.getenv("GROQ_API_KEY")
+    if not k:
         raise ValueError("Thiếu GROQ_API_KEY")
-    if max_tokens is None or max_tokens > 1024:
-        max_tokens = 1024
+    if max_tokens is None or max_tokens > 600:
+        max_tokens = 600
     return ChatGroq(model=model, temperature=temperature, max_tokens=max_tokens)
 
-SYSTEM_INSTRUCTIONS = (
-    "Bạn là trợ lý trả lời về Chương Trình Đào Tạo UIT (Khóa 2025).\n"
-    "Nguyên tắc:\n"
-    "• Chỉ dùng thông tin đã được cung cấp trong dữ liệu tham chiếu (nếu có). Không bịa.\n"
-    "• Nếu dữ liệu chưa đủ để kết luận, nói ngắn gọn rằng chưa đủ và gợi ý cách hỏi cụ thể hơn.\n"
-    "• Trả lời tiếng Việt chuẩn, ngắn gọn, mạch lạc; có thể dùng gạch đầu dòng khi phù hợp.\n"
-    "• Không đề cập đến quy trình nội bộ, công cụ hay cách bạn có dữ liệu.\n"
-    "• Không tạo nhãn Nguồn.\n"
-)
+SYSTEM = "Bạn là chuyên gia về ngành và các môn học (theo chương trình đào tạo 2025) tại trường UIT. Chỉ dùng dữ liệu tham chiếu nếu có; nếu thiếu nói chưa đủ và yêu cầu làm rõ. Trả lời ngắn, tiếng Việt. Không thêm nhãn nguồn."
 
-PLANNER_PROMPT = ChatPromptTemplate.from_messages(
+PROMPT = ChatPromptTemplate.from_messages(
     [
-        ("system", "Bạn là tác nhân điều phối cho trợ lý RAG về CTĐT UIT. Viết lại câu hỏi thành câu hỏi độc lập dựa trên lịch sử và ngữ cảnh dài hạn. Nếu câu hỏi liên quan đến CTĐT hãy gọi công cụ 'retrieve' với truy vấn ngắn gọn; nếu không cần dữ liệu thì trả lời trực tiếp ngắn gọn."),
+        ("system", SYSTEM),
         MessagesPlaceholder("history"),
-        ("system", "Hồ sơ người dùng:\n{profile}"),
-        ("system", "Ngữ cảnh dài hạn:\n{semantic}"),
-        ("human", "{question}"),
-    ]
-)
-
-ANSWER_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        ("system", SYSTEM_INSTRUCTIONS),
-        MessagesPlaceholder("history"),
-        ("system", "Hồ sơ người dùng:\n{profile}"),
-        ("system", "Ngữ cảnh dài hạn:\n{semantic}"),
-        ("system", "Dữ liệu tham chiếu:\n{contexts}"),
-        ("human", "{question}"),
+        ("human", "Câu hỏi: {question}\n\nDữ liệu tham chiếu:\n{contexts}\n\nKết thúc câu trả lời, nếu trích được ký ức hoặc hồ sơ người dùng, thêm dòng cuối: MEM: {\"mem\": [\"...\"], \"profile\": {\"name\": \"?\", \"language\": \"?\", \"timezone\": \"?\", \"tone\": \"?\", \"detail_level\": \"?\", \"expertise\": \"?\", \"presentation\": \"?\"}}. Nếu không có, bỏ qua dòng MEM.")
     ]
 )
 
 class RAGService:
     def __init__(self, groq_api_key: Optional[str], model: str, temperature: float, k: int, max_ctx_chars: int):
         _ensure_loaded()
-        self.context_formatter = ContextFormatter(max_chars=max_ctx_chars, max_items=k)
-        self.llm_decider = get_groq_llm(groq_api_key, model=model, temperature=0.1, max_tokens=256).bind_tools([retrieve])
-        self.llm_answer = get_groq_llm(groq_api_key, model=model, temperature=temperature, max_tokens=768)
-        self.llm_mem = get_groq_llm(groq_api_key, model=model, temperature=0.1, max_tokens=256)
-        self.profile_mgr = create_memory_manager(self.llm_mem, schemas=[UserProfile], instructions="Cập nhật hồ sơ người dùng từ hội thoại. Trả ra JSON các khóa: name, language, timezone, tone, detail_level, expertise, presentation. Bỏ qua khóa không có giá trị.", enable_inserts=True, enable_updates=True, enable_deletes=False)
-        self.semantic_mgr = create_memory_manager(self.llm_mem, instructions="Trích tối đa 5 ký ức dài hạn hữu ích cho các lượt sau về CTĐT hoặc sở thích trình bày. Mỗi ký ức 1 câu ngắn, rõ. Dùng tiếng Việt.", enable_inserts=True, enable_updates=True, enable_deletes=False)
-        self.planner = RunnableWithMessageHistory(PLANNER_PROMPT | self.llm_decider, lambda sid: _get_hist(sid), input_messages_key="question", history_messages_key="history")
-        self.answerer = RunnableWithMessageHistory(ANSWER_PROMPT | self.llm_answer, lambda sid: _get_hist(sid), input_messages_key="question", history_messages_key="history")
+        self.ctx_fmt = ContextFormatter(max_chars=max_ctx_chars, max_items=k)
+        self.llm = get_groq_llm(groq_api_key, model=model, temperature=temperature, max_tokens=400)
+        self.use_langmem = os.getenv("USE_LANGMEM", "0") == "1"
+        self.mm_profile = create_memory_manager(self.llm, schemas=[], instructions="Trích các trường hồ sơ từ hội thoại dạng JSON phẳng.", enable_inserts=True, enable_updates=True, enable_deletes=False) if self.use_langmem else None
+        self.runnable = RunnableWithMessageHistory(PROMPT | self.llm, lambda sid: _get_hist(sid), input_messages_key="question", history_messages_key="history")
         tools = ToolNode([retrieve])
         g = StateGraph(MessagesState)
-        g.add_node("plan", self.decide)
         g.add_node("tools", tools)
-        g.add_node("answer", self.answer)
+        g.add_node("answer", self.answer_once)
         g.add_node("memorize", self.memorize)
-        g.add_edge(START, "plan")
-        g.add_conditional_edges("plan", tools_condition, {"tools": "tools", END: "answer"})
-        g.add_edge("tools", "answer")
+        g.add_edge(START, "answer")
         g.add_edge("answer", "memorize")
         g.add_edge("memorize", END)
         self.graph = g.compile()
 
-    def _last_user_text(self, messages: List[Any]) -> str:
-        for m in reversed(messages):
-            if getattr(m, "type", "") == "human":
-                return m.content if isinstance(m.content, str) else ""
-        return ""
-
-    def _last_ai_text(self, messages: List[Any]) -> str:
-        for m in reversed(messages):
-            if getattr(m, "type", "") == "ai":
-                return m.content if isinstance(m.content, str) else ""
-        return ""
-
-    def _last_tool_chunks(self, messages: List[Any]) -> List[Dict[str, str]]:
-        last_tool = None
-        for m in reversed(messages):
-            if getattr(m, "type", "") == "tool":
-                last_tool = m
-                break
+    def _retrieve_ctx(self, q: str) -> str:
+        try:
+            r = retrieve.invoke({"query": q})
+        except Exception:
+            try:
+                r = retrieve({"query": q})
+            except Exception:
+                r = []
         chunks = []
-        if last_tool is None:
-            return chunks
-        art = getattr(last_tool, "artifact", None)
-        if isinstance(art, list):
-            for c in art:
+        if isinstance(r, list):
+            for c in r:
                 if isinstance(c, dict):
-                    s = (c.get("content") or "").strip()
+                    s = str(c.get("content") or "").strip()
                     if s:
                         chunks.append({"content": s})
-        elif isinstance(art, dict):
-            s = (art.get("content") or "").strip()
-            if s:
-                chunks.append({"content": s})
-        elif isinstance(art, str):
-            s = art.strip()
-            if s:
-                chunks.append({"content": s})
-        return chunks
-
-    def _format_contexts(self, state_messages: List[Any]) -> str:
-        chunks = self._last_tool_chunks(state_messages)
-        if not chunks:
-            return ""
-        fmt = self.context_formatter
-        for name in ("format", "__call__", "format_context", "format_chunks", "build", "render"):
-            f = getattr(fmt, name, None)
+                elif isinstance(c, str):
+                    s = c.strip()
+                    if s:
+                        chunks.append({"content": s})
+        for name in ("format", "__call__", "format_context", "format_chunks"):
+            f = getattr(self.ctx_fmt, name, None)
             if callable(f):
                 try:
                     return f(chunks)
@@ -207,73 +139,61 @@ class RAGService:
                     return f()
         return "\n\n".join(x.get("content", "") for x in chunks if isinstance(x, dict))
 
-    def decide(self, state: MessagesState, config: Optional[Dict[str, Any]] = None):
-        sid = ((config or {}).get("configurable") or {}).get("thread_id") or "default"
-        q = self._last_user_text(state["messages"])
-        sem = _sem_recall(sid, q)
-        profile = _PROFILE.get(sid)
-        out = self.planner.invoke({"question": q, "semantic": sem, "profile": _profile_text(profile)}, config={"configurable": {"session_id": sid}})
-        return {"messages": [out]}
+    def _extract_mem_line(self, text: str):
+        lines = text.rstrip().splitlines()
+        mem = {"mem": [], "profile": {}}
+        if not lines:
+            return text, mem
+        last = lines[-1].strip()
+        if last.startswith("MEM:"):
+            raw = last[4:].strip()
+            try:
+                obj = json.loads(raw)
+                if isinstance(obj, dict):
+                    if isinstance(obj.get("mem"), list):
+                        mem["mem"] = [str(t) for t in obj["mem"] if isinstance(t, str)]
+                    if isinstance(obj.get("profile"), dict):
+                        mem["profile"] = {k: v for k, v in obj["profile"].items() if v not in (None, "", [])}
+                text = "\n".join(lines[:-1]).rstrip()
+            except Exception:
+                pass
+        return text, mem
 
-    def answer(self, state: MessagesState, config: Optional[Dict[str, Any]] = None):
+    def answer_once(self, state: MessagesState, config: Optional[Dict[str, Any]] = None):
         sid = ((config or {}).get("configurable") or {}).get("thread_id") or "default"
-        q = self._last_user_text(state["messages"])
-        ctx = self._format_contexts(state["messages"])
-        sem = _sem_recall(sid, q)
-        profile = _PROFILE.get(sid)
-        msgs = self.answerer.invoke({"question": q, "contexts": ctx, "semantic": sem, "profile": _profile_text(profile)}, config={"configurable": {"session_id": sid}})
-        return {"messages": [msgs]}
+        _trim_hist(sid)
+        q = ""
+        for m in reversed(state["messages"]):
+            if getattr(m, "type", "") == "human":
+                q = m.content if isinstance(m.content, str) else ""
+                break
+        ctx = self._retrieve_ctx(q) or _sem_recall(sid, q, 4, 400)
+        msg = self.runnable.invoke({"question": q, "contexts": ctx}, config={"configurable": {"session_id": sid}})
+        text, mem = self._extract_mem_line(getattr(msg, "content", "") if hasattr(msg, "content") else str(msg))
+        cleaned = AIMessage(content=text)
+        return {"messages": [cleaned], "mem": mem, "ctx_dump": ctx}
 
     def memorize(self, state: MessagesState, config: Optional[Dict[str, Any]] = None):
         sid = ((config or {}).get("configurable") or {}).get("thread_id") or "default"
-        q = self._last_user_text(state["messages"])
-        a = self._last_ai_text(state["messages"])
-        ctx = self._format_contexts(state["messages"])
-        if not q.strip() and not a.strip():
-            return {}
-        convo = [{"role": "user", "content": q}]
-        if a.strip():
-            convo.append({"role": "assistant", "content": a})
-        try:
-            prof_out = self.profile_mgr.invoke({"messages": convo})
-            merged = {}
-            for m in prof_out or []:
-                c = getattr(m, "content", m)
-                if isinstance(c, dict):
-                    merged.update({k: v for k, v in c.items() if v not in (None, "", [])})
-                elif isinstance(c, str):
-                    try:
-                        d = json.loads(c)
-                        if isinstance(d, dict):
-                            merged.update({k: v for k, v in d.items() if v not in (None, "", [])})
-                    except Exception:
-                        pass
-            if merged:
-                _PROFILE[sid] = UserProfile(**merged)
-        except Exception:
-            pass
-        try:
-            mems = self.semantic_mgr.invoke({"messages": convo})
-            texts = []
-            for m in mems or []:
-                c = getattr(m, "content", m)
-                if isinstance(c, str):
-                    s = c.strip()
-                    if s and s.upper() != "NONE":
-                        texts.append(s)
-                elif isinstance(c, dict):
-                    s = json.dumps(c, ensure_ascii=False)
-                    if s:
-                        texts.append(s)
-            if texts:
-                _sem_add(sid, texts)
-        except Exception:
-            pass
+        mem = state.get("mem") or {}
+        mem_texts = [t for t in mem.get("mem", []) if isinstance(t, str) and t.strip()]
+        if not mem_texts:
+            ctx = state.get("ctx_dump") or ""
+            lines = [x.strip() for x in ctx.split("\n") if x.strip()]
+            mem_texts = lines[:5]
+        if mem_texts:
+            _sem_add(sid, mem_texts)
+        prof = mem.get("profile") or {}
+        if prof and self.use_langmem and self.mm_profile is not None:
+            try:
+                self.mm_profile.invoke({"messages": [{"role": "assistant", "content": json.dumps(prof, ensure_ascii=False)}]})
+            except Exception:
+                pass
         return {}
 
     def qa(self, question: str, thread_id: Optional[str] = None) -> Dict[str, Any]:
         cfg = {"configurable": {"thread_id": thread_id or "default"}}
         return self.graph.invoke({"messages": [HumanMessage(content=question)]}, config=cfg)
 
-def create_rag_chain(groq_api_key: Optional[str], *, model: str = "llama-3.3-70b-versatile", temperature: float = 0.2, k: int = 6, max_ctx_chars: int = 8000) -> RAGService:
+def create_rag_chain(groq_api_key: Optional[str], *, model: str = "llama-3.3-70b-versatile", temperature: float = 0.2, k: int = 6, max_ctx_chars: int = 6000) -> RAGService:
     return RAGService(groq_api_key, model, temperature, k, max_ctx_chars)
