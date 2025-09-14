@@ -58,7 +58,7 @@ if not st.session_state.get("GROQ_API_KEY"):
     st.stop()
 
 model = "llama-3.3-70b-versatile"
-temperature = 0.2
+temperature = 0.5
 k = 6
 
 @st.cache_resource(show_spinner=False)
