@@ -1,12 +1,12 @@
 import os
 import sys
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Callable
+from typing import Optional, Dict, Any, Callable
 import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-from backend.LLMService import create_rag_chain
+from backend.LLMService import LLMService
 
 st.set_page_config(page_title="UIT RAG Chatbot", page_icon="🎓", layout="centered")
 st.header("🎓 UIT RAG Chatbot")
@@ -37,7 +37,7 @@ k = 6
 
 @st.cache_resource(show_spinner=False)
 def make_chain(groq_api_key: str, model: str, temperature: float, k: int) -> Callable[[str], Dict[str, Any]]:
-    return create_rag_chain(groq_api_key=groq_api_key, model=model, temperature=temperature, k=k)
+    return LLMService(groq_api_key=groq_api_key, model=model, temperature=temperature)
 
 qa = make_chain(
     groq_api_key=st.session_state["GROQ_API_KEY"],

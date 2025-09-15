@@ -17,6 +17,8 @@ langchain_groq
 langchain-chroma
 langchain-experimental
 langchain_huggingface
+langgraph-checkpoint-sqlite
+langmem
 chromadb
 tqdm
 sentence-transformers

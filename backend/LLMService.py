@@ -1,28 +1,15 @@
 from __future__ import annotations
-from typing import Callable, List, Dict, Any, Optional
-import os
-from langchain_groq import ChatGroq
-from langgraph.prebuilt import ToolNode, tools_condition
+from typing import Any, Dict, List, Optional
 from langgraph.constants import END, START
 from langgraph.graph import MessagesState, StateGraph
 from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_core.prompts import ChatPromptTemplate, FewShotChatMessagePromptTemplate
+from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.store.memory import InMemoryStore
+from langchain_core.prompts import ChatPromptTemplate
 from .FullChain import retrieve, _ensure_loaded, ContextFormatter
-
-def get_groq_llm(
-    groq_api_key: Optional[str] = None,
-    model: str = "llama-3.3-70b-versatile",
-    temperature: float = 0.2,
-    max_tokens: Optional[int] = None,
-) -> ChatGroq:
-    key = groq_api_key or os.getenv("GROQ_API_KEY")
-    if not key:
-        raise ValueError("Thiếu GROQ_API_KEY")
-    return ChatGroq(
-        model=model,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
+from .EmbeddingManager import get_encoder
+from langchain_groq import ChatGroq
+import os
 
 SYSTEM_INSTRUCTIONS = (
     "Bạn là trợ lý trả lời về Chương Trình Đào Tạo UIT (Khóa 2025).\n"
@@ -33,48 +20,9 @@ SYSTEM_INSTRUCTIONS = (
     "• Không đề cập đến quy trình nội bộ, công cụ hay cách bạn có dữ liệu.\n"
 )
 
-ANSWER_EXAMPLES = [
-    {
-        "input": "Môn IT007 bao nhiêu tín chỉ?",
-        "context": "- IT007 | Hệ điều hành | 4 | 3 | 1",
-        "output": "IT007 có 4 tín chỉ."
-    },
-    {
-        "input": "Tên môn DS101 là gì?",
-        "context": "- DS101 | Thống kê và xác suất chuyên sâu | …",
-        "output": "DS101 là \"Thống kê và xác suất chuyên sâu\"."
-    },
-    {
-        "input": "Môn CS116 học về gì?",
-        "context": "- CS116 | Lập trình Python cho Máy học | Môn học cung cấp kiến thức và kỹ năng lập trình Python áp dụng cho bài toán machine learning.",
-        "output": "CS116 (Lập trình Python cho Máy học) cung cấp kiến thức và kỹ năng Python cho các bài toán máy học."
-    },
-    {
-        "input": "So sánh số tín chỉ giữa CS115 và CS116.",
-        "context": "- CS115 | Toán cho Khoa học máy tính | 4 | 4 | 0\n- CS116 | Lập trình Python cho Máy học | 4 | 3 | 1",
-        "output": "- CS115: 4 tín chỉ\n- CS116: 4 tín chỉ"
-    },
-    {
-        "input": "Mã môn của \"Hệ điều hành\" là gì?",
-        "context": "- IT007 | Hệ điều hành | …",
-        "output": "Mã môn của \"Hệ điều hành\" là IT007."
-    },
-]
-
-EXAMPLE_PROMPT = ChatPromptTemplate.from_messages([
-    ("human", "Câu hỏi (ví dụ): {input}\n\nDữ liệu tham chiếu (ví dụ):\n{context}"),
-    ("ai", "{output}")
-])
-
-FEW_SHOT = FewShotChatMessagePromptTemplate(
-    examples=ANSWER_EXAMPLES,
-    example_prompt=EXAMPLE_PROMPT,
-)
-
 ANSWER_PROMPT = ChatPromptTemplate.from_messages(
     [
         ("system", SYSTEM_INSTRUCTIONS),
-        FEW_SHOT,
         (
             "human",
             "Câu hỏi: {question}\n\n"
@@ -89,24 +37,19 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages(
 )
 
 def _collect_tool_chunks_from_state(state: MessagesState) -> List[Dict[str, Any]]:
-    """Lấy artifact từ các ToolMessage gần nhất (nếu có)."""
-    recent_tool_messages = []
-    for message in reversed(state["messages"]):
-        if message.type == "tool":
-            recent_tool_messages.append(message)
-        else:
-            break
-    tool_messages = recent_tool_messages[::-1]
-
+    """Lấy artifact từ các ToolMessage gần nhất, scan ngắn gọn."""
     chunks: List[Dict[str, Any]] = []
-    for m in tool_messages:
-        if hasattr(m, "artifact") and isinstance(m.artifact, list):
-            for c in m.artifact:
-                if isinstance(c, dict):
-                    content = (c.get("content") or "").strip()
-                    if content:
-                        chunks.append({"content": content})
-    return chunks
+    # chỉ scan các ToolMessage gần nhất (reversed)
+    for msg in reversed(state["messages"]):
+        if getattr(msg, "type", None) != "tool":
+            break
+        artifact = getattr(msg, "artifact", [])
+        if isinstance(artifact, list):
+            for c in artifact:
+                content = c.get("content", "").strip()
+                if content:
+                    chunks.append(c)
+    return chunks[::-1]  # giữ thứ tự thời gian
 
 def _get_last_user_question(state: MessagesState) -> str:
     for m in reversed(state["messages"]):
@@ -114,28 +57,33 @@ def _get_last_user_question(state: MessagesState) -> str:
             return str(m.content or "")
     return ""
 
-def create_rag_chain(
-    groq_api_key: Optional[str],
-    *,
-    model: str = "llama-3.3-70b-versatile",
-    temperature: float = 0.2,
-    k: int = 6,
-    max_ctx_chars: int = 8000,
-) -> Callable[[str], Dict[str, Any]]:
+class LLMService(ContextFormatter):
+    def __init__(self, groq_api_key: Optional[str] = None, model: str = "llama-3.3-70b-versatile", temperature: float = 0.2, max_tokens: Optional[int] = None):
+        _ensure_loaded()
+        super().__init__()
+        self.llm = self.__init_LLM(groq_api_key=groq_api_key, model=model, temperature=temperature, max_tokens=max_tokens)
+        self.encoder = self.__init_Encoder()
+        self.store = self.__init_Storage()
+        self.graph = self.__init_Graph()
 
-    _ensure_loaded()
-
-    llm_decider = get_groq_llm(
-        groq_api_key, model=model, temperature=temperature, max_tokens=7000
-    ).bind_tools([retrieve])
-
-    llm_answer = get_groq_llm(
-        groq_api_key, model=model, temperature=temperature, max_tokens=7000
-    )
-
-    context_formatter = ContextFormatter(max_chars=max_ctx_chars, max_items=k)
-
-    def query_or_response(state: MessagesState):
+    def __init_LLM(self, groq_api_key: Optional[str] = None, model: str = "llama-3.3-70b-versatile", temperature: float = 0.2, max_tokens: Optional[int] = None) -> ChatGroq:
+        key = groq_api_key or os.getenv("GROQ_API_KEY")
+        if not key:
+            raise ValueError("Thiếu GROQ_API_KEY")
+        return ChatGroq(model=model, temperature=temperature, max_tokens=max_tokens)
+    
+    def __init_Encoder(self):
+        return get_encoder()
+    
+    def __init_Storage(self):
+        return InMemoryStore(
+            index={
+                "dims": 1536,
+                "embed": self.encoder
+            }
+        )
+    
+    def query_or_response(self, state: MessagesState):
         """Node 1: Cho phép LLM quyết định có cần tool."""
         planner_system = SystemMessage(
             content=(
@@ -145,33 +93,34 @@ def create_rag_chain(
                 "Nếu có thể trả lời ngay, đừng gọi công cụ."
             )
         )
-        response = llm_decider.invoke([planner_system] + state["messages"])
+        llm_with_tools = self.llm.bind_tools([retrieve])
+        response = llm_with_tools.invoke([planner_system] + state["messages"])
         return {"messages": [response]}
-
-    def generate_with_context(state: MessagesState):
+    
+    def generate_with_context(self, state: MessagesState):
         """Node 2: Sau khi (có thể) đã gọi tool, tổng hợp trả lời bằng PromptTemplate."""
         chunks = _collect_tool_chunks_from_state(state)
-        contexts = context_formatter.format_context(chunks)
-        question = _get_last_user_question(state)
-        messages = ANSWER_PROMPT.format_messages(question=question, contexts=contexts)
-        out = llm_answer.invoke(messages)
+        contexts = self.format_context(chunks)
+        messages = ANSWER_PROMPT.format_messages(question=_get_last_user_question(state), contexts=contexts)
+        out = self.llm.invoke(messages)
         return {"messages": [out]}
 
-    tools = ToolNode([retrieve])
+    def __init_Graph(self):
+        tools = ToolNode([retrieve])
+        graph_builder = StateGraph(MessagesState)
+        graph_builder.add_node("query_or_response", self.query_or_response)
+        graph_builder.add_node("tools", tools)
+        graph_builder.add_node("generate_with_context", self.generate_with_context)
+        graph_builder.add_edge(START, "query_or_response")
+        graph_builder.add_conditional_edges("query_or_response", tools_condition, {END: END, "tools": "tools"})
+        graph_builder.add_edge("tools", "generate_with_context")
+        graph_builder.add_edge("generate_with_context", END)
+        return graph_builder.compile()
+    
+    def visualize(self, filename: str = "llm_service_graph"):
+        bytes = self.graph.get_graph().draw_mermaid_png()
+        with open(f"{filename}.png", "wb") as f:
+            f.write(bytes)
 
-    graph_builder = StateGraph(MessagesState)
-    graph_builder.add_node("query_or_response", query_or_response)
-    graph_builder.add_node("tools", tools)
-    graph_builder.add_node("generate_with_context", generate_with_context)
-
-    graph_builder.add_edge(START, "query_or_response")
-    graph_builder.add_conditional_edges("query_or_response", tools_condition, {END: END, "tools": "tools"})
-    graph_builder.add_edge("tools", "generate_with_context")
-    graph_builder.add_edge("generate_with_context", END)
-    graph = graph_builder.compile()
-
-    def qa(question: str, topk: Optional[int] = None) -> Dict[str, Any]:
-        result = graph.invoke({"messages": [HumanMessage(content=question)]})
-        return result
-
-    return qa
+    def __call__(self, question: str, topk: Optional[int] = None) -> Any:
+        return self.graph.invoke({"messages": [HumanMessage(content=question)]})

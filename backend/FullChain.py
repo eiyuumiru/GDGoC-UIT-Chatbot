@@ -113,6 +113,8 @@ def retrieve(query: str) -> tuple[str, List[Dict[str, Any]]]:
         })
     return query, results
 
+
+
 class ContextFormatter:
     def __init__(self, max_chars: int = 8000, max_items: int = 6):
         self.max_chars = max_chars
@@ -154,9 +156,6 @@ class ContextFormatter:
         return md.strip()
 
     def format_context(self, chunks: List[Dict[str, Any]]) -> str:
-        """
-        Biến danh sách chunk thành markdown đẹp, nhận dạng bảng/mô tả.
-        """
         buf, total = [], 0
         for i, c in enumerate(chunks[:self.max_items]):
             piece = (c.get("content") or "").strip()
@@ -164,13 +163,10 @@ class ContextFormatter:
                 continue
             if total + len(piece) > self.max_chars:
                 break
-
             if "|" in piece and re.search(r"[A-Z]{2,}\d+", piece):
                 piece_fmt = self._normalize_table(piece)
             else:
                 piece_fmt = self._normalize_text(piece)
-
-            buf.append(f"### Nguồn {i+1}\n{piece_fmt}")
+            buf.append(piece_fmt)
             total += len(piece)
-
         return "\n\n".join(buf)
