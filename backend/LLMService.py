@@ -1,199 +1,126 @@
 from __future__ import annotations
-from typing import Dict, Any, Optional, List
-import os, math, time, json
-from langchain_groq import ChatGroq
+from typing import Any, Dict, List, Optional
 from langgraph.constants import END, START
 from langgraph.graph import MessagesState, StateGraph
-from langchain_core.messages import HumanMessage, AIMessage
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_core.chat_history import BaseChatMessageHistory
-from langchain_community.chat_message_histories import ChatMessageHistory
-from langgraph.prebuilt import ToolNode
-from langmem import create_memory_manager
+from langchain_core.messages import SystemMessage, HumanMessage
+from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.store.memory import InMemoryStore
+from langchain_core.prompts import ChatPromptTemplate
 from .FullChain import retrieve, _ensure_loaded, ContextFormatter
 from .EmbeddingManager import get_encoder
+from langchain_groq import ChatGroq
+import os
 
-_HIST: Dict[str, ChatMessageHistory] = {}
-_SEM: Dict[str, List[Dict[str, Any]]] = {}
-_EMB = None
+SYSTEM_INSTRUCTIONS = (
+    "Bạn là trợ lý trả lời về Chương Trình Đào Tạo UIT (Khóa 2025).\n"
+    "Nguyên tắc:\n"
+    "• Chỉ dùng thông tin đã được cung cấp trong dữ liệu tham chiếu (nếu có). Không bịa.\n"
+    "• Nếu dữ liệu chưa đủ để kết luận, nói ngắn gọn rằng chưa đủ và gợi ý cách hỏi cụ thể hơn.\n"
+    "• Trả lời tiếng Việt chuẩn, ngắn gọn, mạch lạc; có thể dùng gạch đầu dòng khi phù hợp.\n"
+    "• Không đề cập đến quy trình nội bộ, công cụ hay cách bạn có dữ liệu.\n"
+)
 
-def _get_hist(session_id: str) -> BaseChatMessageHistory:
-    if session_id not in _HIST:
-        _HIST[session_id] = ChatMessageHistory()
-    return _HIST[session_id]
-
-def _ensure_emb():
-    global _EMB
-    if _EMB is None:
-        _EMB = get_encoder(batch_size=32, device=os.getenv("EMB_DEVICE", "cpu"), show_tqdm=False)
-    return _EMB
-
-def _vec(x):
-    if hasattr(x, "tolist"):
-        x = x.tolist()
-    if isinstance(x, (list, tuple)) and len(x) == 1 and isinstance(x[0], (list, tuple)):
-        x = x[0]
-    return [float(v) for v in x]
-
-def _dot(a, b):
-    return float(sum(x * y for x, y in zip(a, b)))
-
-def _norm(a):
-    s = sum(x * x for x in a)
-    return math.sqrt(s) if s > 0 else 1e-8
-
-def _cos(a, b):
-    return _dot(a, b) / (_norm(a) * _norm(b))
-
-def _sem_add(session_id: str, texts: List[str]):
-    if not texts:
-        return
-    vecs = [_vec(v) for v in _ensure_emb().embed_documents(texts)]
-    bucket = _SEM.setdefault(session_id, [])
-    ts = time.time()
-    for t, v in zip(texts, vecs):
-        bucket.append({"t": t, "v": v, "ts": ts})
-
-def _sem_recall(session_id: str, query: str, k: int = 5, max_chars: int = 600):
-    items = _SEM.get(session_id, [])
-    if not items or not query.strip():
-        return ""
-    qv = _vec(_ensure_emb().embed_query(query))
-    scored = sorted(((it["t"], _cos(qv, it["v"])) for it in items), key=lambda x: x[1], reverse=True)
-    out, acc = [], 0
-    for t, _ in scored[: max(1, k)]:
-        if acc + len(t) > max_chars:
-            break
-        out.append(t)
-        acc += len(t)
-    return "\n".join(out)
-
-def _trim_hist(session_id: str, max_messages: int = 10):
-    h = _get_hist(session_id)
-    msgs = getattr(h, "messages", [])
-    if len(msgs) > max_messages:
-        h.messages = msgs[-max_messages:]
-
-def get_groq_llm(key: Optional[str] = None, model: str = "llama-3.3-70b-versatile", temperature: float = 0.2, max_tokens: Optional[int] = None) -> ChatGroq:
-    k = key or os.getenv("GROQ_API_KEY")
-    if not k:
-        raise ValueError("Thiếu GROQ_API_KEY")
-    if max_tokens is None or max_tokens > 600:
-        max_tokens = 600
-    return ChatGroq(model=model, temperature=temperature, max_tokens=max_tokens)
-
-SYSTEM = "Bạn là chuyên gia về ngành và các môn học (theo chương trình đào tạo 2025) tại trường UIT. Chỉ dùng dữ liệu tham chiếu nếu có; nếu thiếu nói chưa đủ và yêu cầu làm rõ. Trả lời ngắn, tiếng Việt. Không thêm nhãn nguồn."
-
-PROMPT = ChatPromptTemplate.from_messages(
+ANSWER_PROMPT = ChatPromptTemplate.from_messages(
     [
-        ("system", SYSTEM),
-        MessagesPlaceholder("history"),
-        ("human", "Câu hỏi: {question}\n\nDữ liệu tham chiếu:\n{contexts}\n\nKết thúc câu trả lời, nếu trích được ký ức hoặc hồ sơ người dùng, thêm dòng cuối: MEM: {\"mem\": [\"...\"], \"profile\": {\"name\": \"?\", \"language\": \"?\", \"timezone\": \"?\", \"tone\": \"?\", \"detail_level\": \"?\", \"expertise\": \"?\", \"presentation\": \"?\"}}. Nếu không có, bỏ qua dòng MEM.")
+        ("system", SYSTEM_INSTRUCTIONS),
+        (
+            "human",
+            "Câu hỏi: {question}\n\n"
+            "Dữ liệu tham chiếu (có thể trống):\n"
+            "----------------\n"
+            "{contexts}\n"
+            "----------------\n\n"
+            "Yêu cầu: Dựa vào dữ liệu trên để trả lời ngắn gọn, rõ ràng. "
+            "Nếu dữ liệu không đủ, hãy nói rằng chưa đủ thông tin và gợi ý cách hỏi cụ thể hơn."
+        ),
     ]
 )
 
-class RAGService:
-    def __init__(self, groq_api_key: Optional[str], model: str, temperature: float, k: int, max_ctx_chars: int):
+def _collect_tool_chunks_from_state(state: MessagesState) -> List[Dict[str, Any]]:
+    """Lấy artifact từ các ToolMessage gần nhất, scan ngắn gọn."""
+    chunks: List[Dict[str, Any]] = []
+    # chỉ scan các ToolMessage gần nhất (reversed)
+    for msg in reversed(state["messages"]):
+        if getattr(msg, "type", None) != "tool":
+            break
+        artifact = getattr(msg, "artifact", [])
+        if isinstance(artifact, list):
+            for c in artifact:
+                content = c.get("content", "").strip()
+                if content:
+                    chunks.append(c)
+    return chunks[::-1]  # giữ thứ tự thời gian
+
+def _get_last_user_question(state: MessagesState) -> str:
+    for m in reversed(state["messages"]):
+        if m.type == "human":
+            return str(m.content or "")
+    return ""
+
+class LLMService(ContextFormatter):
+    def __init__(self, groq_api_key: Optional[str] = None, model: str = "llama-3.3-70b-versatile", temperature: float = 0.2, max_tokens: Optional[int] = None):
         _ensure_loaded()
-        self.ctx_fmt = ContextFormatter(max_chars=max_ctx_chars, max_items=k)
-        self.llm = get_groq_llm(groq_api_key, model=model, temperature=temperature, max_tokens=400)
-        self.use_langmem = os.getenv("USE_LANGMEM", "0") == "1"
-        self.mm_profile = create_memory_manager(self.llm, schemas=[], instructions="Trích các trường hồ sơ từ hội thoại dạng JSON phẳng.", enable_inserts=True, enable_updates=True, enable_deletes=False) if self.use_langmem else None
-        self.runnable = RunnableWithMessageHistory(PROMPT | self.llm, lambda sid: _get_hist(sid), input_messages_key="question", history_messages_key="history")
+        super().__init__()
+        self.llm = self.__init_LLM(groq_api_key=groq_api_key, model=model, temperature=temperature, max_tokens=max_tokens)
+        self.encoder = self.__init_Encoder()
+        self.store = self.__init_Storage()
+        self.graph = self.__init_Graph()
+
+    def __init_LLM(self, groq_api_key: Optional[str] = None, model: str = "llama-3.3-70b-versatile", temperature: float = 0.2, max_tokens: Optional[int] = None) -> ChatGroq:
+        key = groq_api_key or os.getenv("GROQ_API_KEY")
+        if not key:
+            raise ValueError("Thiếu GROQ_API_KEY")
+        return ChatGroq(model=model, temperature=temperature, max_tokens=max_tokens)
+    
+    def __init_Encoder(self):
+        return get_encoder()
+    
+    def __init_Storage(self):
+        return InMemoryStore(
+            index={
+                "dims": 1536,
+                "embed": self.encoder
+            }
+        )
+    
+    def query_or_response(self, state: MessagesState):
+        """Node 1: Cho phép LLM quyết định có cần tool."""
+        planner_system = SystemMessage(
+            content=(
+                "Bạn là một trợ lý thông minh cho CTĐT UIT. "
+                "Nếu câu hỏi cần chi tiết cụ thể từ dữ liệu chương trình (môn học, tín chỉ, học kỳ, điều kiện, quy định...), "
+                "hãy gọi công cụ 'retrieve' với truy vấn ngắn gọn tiếng Việt. "
+                "Nếu có thể trả lời ngay, đừng gọi công cụ."
+            )
+        )
+        llm_with_tools = self.llm.bind_tools([retrieve])
+        response = llm_with_tools.invoke([planner_system] + state["messages"])
+        return {"messages": [response]}
+    
+    def generate_with_context(self, state: MessagesState):
+        """Node 2: Sau khi (có thể) đã gọi tool, tổng hợp trả lời bằng PromptTemplate."""
+        chunks = _collect_tool_chunks_from_state(state)
+        contexts = self.format_context(chunks)
+        messages = ANSWER_PROMPT.format_messages(question=_get_last_user_question(state), contexts=contexts)
+        out = self.llm.invoke(messages)
+        return {"messages": [out]}
+
+    def __init_Graph(self):
         tools = ToolNode([retrieve])
-        g = StateGraph(MessagesState)
-        g.add_node("tools", tools)
-        g.add_node("answer", self.answer_once)
-        g.add_node("memorize", self.memorize)
-        g.add_edge(START, "answer")
-        g.add_edge("answer", "memorize")
-        g.add_edge("memorize", END)
-        self.graph = g.compile()
+        graph_builder = StateGraph(MessagesState)
+        graph_builder.add_node("query_or_response", self.query_or_response)
+        graph_builder.add_node("tools", tools)
+        graph_builder.add_node("generate_with_context", self.generate_with_context)
+        graph_builder.add_edge(START, "query_or_response")
+        graph_builder.add_conditional_edges("query_or_response", tools_condition, {END: END, "tools": "tools"})
+        graph_builder.add_edge("tools", "generate_with_context")
+        graph_builder.add_edge("generate_with_context", END)
+        return graph_builder.compile()
+    
+    def visualize(self, filename: str = "llm_service_graph"):
+        bytes = self.graph.get_graph().draw_mermaid_png()
+        with open(f"{filename}.png", "wb") as f:
+            f.write(bytes)
 
-    def _retrieve_ctx(self, q: str) -> str:
-        try:
-            r = retrieve.invoke({"query": q})
-        except Exception:
-            try:
-                r = retrieve({"query": q})
-            except Exception:
-                r = []
-        chunks = []
-        if isinstance(r, list):
-            for c in r:
-                if isinstance(c, dict):
-                    s = str(c.get("content") or "").strip()
-                    if s:
-                        chunks.append({"content": s})
-                elif isinstance(c, str):
-                    s = c.strip()
-                    if s:
-                        chunks.append({"content": s})
-        for name in ("format", "__call__", "format_context", "format_chunks"):
-            f = getattr(self.ctx_fmt, name, None)
-            if callable(f):
-                try:
-                    return f(chunks)
-                except TypeError:
-                    return f()
-        return "\n\n".join(x.get("content", "") for x in chunks if isinstance(x, dict))
-
-    def _extract_mem_line(self, text: str):
-        lines = text.rstrip().splitlines()
-        mem = {"mem": [], "profile": {}}
-        if not lines:
-            return text, mem
-        last = lines[-1].strip()
-        if last.startswith("MEM:"):
-            raw = last[4:].strip()
-            try:
-                obj = json.loads(raw)
-                if isinstance(obj, dict):
-                    if isinstance(obj.get("mem"), list):
-                        mem["mem"] = [str(t) for t in obj["mem"] if isinstance(t, str)]
-                    if isinstance(obj.get("profile"), dict):
-                        mem["profile"] = {k: v for k, v in obj["profile"].items() if v not in (None, "", [])}
-                text = "\n".join(lines[:-1]).rstrip()
-            except Exception:
-                pass
-        return text, mem
-
-    def answer_once(self, state: MessagesState, config: Optional[Dict[str, Any]] = None):
-        sid = ((config or {}).get("configurable") or {}).get("thread_id") or "default"
-        _trim_hist(sid)
-        q = ""
-        for m in reversed(state["messages"]):
-            if getattr(m, "type", "") == "human":
-                q = m.content if isinstance(m.content, str) else ""
-                break
-        ctx = self._retrieve_ctx(q) or _sem_recall(sid, q, 4, 400)
-        msg = self.runnable.invoke({"question": q, "contexts": ctx}, config={"configurable": {"session_id": sid}})
-        text, mem = self._extract_mem_line(getattr(msg, "content", "") if hasattr(msg, "content") else str(msg))
-        cleaned = AIMessage(content=text)
-        return {"messages": [cleaned], "mem": mem, "ctx_dump": ctx}
-
-    def memorize(self, state: MessagesState, config: Optional[Dict[str, Any]] = None):
-        sid = ((config or {}).get("configurable") or {}).get("thread_id") or "default"
-        mem = state.get("mem") or {}
-        mem_texts = [t for t in mem.get("mem", []) if isinstance(t, str) and t.strip()]
-        if not mem_texts:
-            ctx = state.get("ctx_dump") or ""
-            lines = [x.strip() for x in ctx.split("\n") if x.strip()]
-            mem_texts = lines[:5]
-        if mem_texts:
-            _sem_add(sid, mem_texts)
-        prof = mem.get("profile") or {}
-        if prof and self.use_langmem and self.mm_profile is not None:
-            try:
-                self.mm_profile.invoke({"messages": [{"role": "assistant", "content": json.dumps(prof, ensure_ascii=False)}]})
-            except Exception:
-                pass
-        return {}
-
-    def qa(self, question: str, thread_id: Optional[str] = None) -> Dict[str, Any]:
-        cfg = {"configurable": {"thread_id": thread_id or "default"}}
-        return self.graph.invoke({"messages": [HumanMessage(content=question)]}, config=cfg)
-
-def create_rag_chain(groq_api_key: Optional[str], *, model: str = "llama-3.3-70b-versatile", temperature: float = 0.2, k: int = 6, max_ctx_chars: int = 6000) -> RAGService:
-    return RAGService(groq_api_key, model, temperature, k, max_ctx_chars)
+    def __call__(self, question: str, topk: Optional[int] = None) -> Any:
+        return self.graph.invoke({"messages": [HumanMessage(content=question)]})

@@ -113,6 +113,8 @@ def retrieve(query: str) -> tuple[str, List[Dict[str, Any]]]:
         })
     return query, results
 
+
+
 class ContextFormatter:
     def __init__(self, max_chars: int = 8000, max_items: int = 6):
         self.max_chars = max_chars

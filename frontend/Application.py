@@ -1,40 +1,15 @@
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any, Callable
 import streamlit as st
-from uuid import uuid4
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
-from backend.LLMService import create_rag_chain
+from backend.LLMService import LLMService
 
 st.set_page_config(page_title="UIT RAG Chatbot", page_icon="🎓", layout="centered")
 st.header("🎓 UIT RAG Chatbot")
-
-if "thread_id" not in st.session_state:
-    st.session_state["thread_id"] = str(uuid4())
-if "messages" not in st.session_state:
-    st.session_state["messages"] = [{"role": "assistant", "content": "Xin chào! Hỏi gì về CTĐT UIT 2025?"}]
-
-st.subheader("Bộ nhớ hội thoại")
-outer_left, outer_main, outer_right = st.columns([1, 8, 1])
-with outer_main:
-    r1c1, r1c2, r1c3 = st.columns([3, 1.2, 1.6])
-    with r1c1:
-        st.text_input("Thread ID hiện tại", value=st.session_state["thread_id"], key="thread_id_display", disabled=True, label_visibility="collapsed", placeholder="Thread ID")
-    with r1c2:
-        if st.button("Tạo thread mới", use_container_width=True):
-            st.session_state["thread_id"] = str(uuid4())
-            st.session_state["messages"] = [{"role": "assistant", "content": "Đã tạo cuộc trò chuyện mới."}]
-            st.rerun()
-    with r1c3:
-        if st.button("Xoá memory (tạo thread mới)", use_container_width=True):
-            st.session_state["thread_id"] = str(uuid4())
-            st.session_state["messages"] = [{"role": "assistant", "content": "Đã xoá bộ nhớ của thread cũ và khởi tạo hội thoại mới."}]
-            st.rerun()
 
 def get_secret_or_input(secret_key: str, label: str, help_url: Optional[str] = None) -> Optional[str]:
     if hasattr(st, "secrets") and secret_key in st.secrets:
@@ -46,7 +21,9 @@ def get_secret_or_input(secret_key: str, label: str, help_url: Optional[str] = N
         st.caption(f"Chưa có key? Xem: {help_url}")
     return val or None
 
-groq_key = st.session_state.get("GROQ_API_KEY") or get_secret_or_input("GROQ_API_KEY", "GROQ API key", "https://console.groq.com/keys")
+groq_key = st.session_state.get("GROQ_API_KEY") or get_secret_or_input(
+    "GROQ_API_KEY", "GROQ API key", "https://console.groq.com/keys"
+)
 if groq_key:
     st.session_state["GROQ_API_KEY"] = groq_key
 
@@ -59,10 +36,18 @@ temperature = 0.5
 k = 6
 
 @st.cache_resource(show_spinner=False)
-def make_service(groq_api_key: str, model: str, temperature: float, k: int):
-    return create_rag_chain(groq_api_key=groq_api_key, model=model, temperature=temperature, k=k)
+def make_chain(groq_api_key: str, model: str, temperature: float, k: int) -> Callable[[str], Dict[str, Any]]:
+    return LLMService(groq_api_key=groq_api_key, model=model, temperature=temperature)
 
-service = make_service(st.session_state["GROQ_API_KEY"], model, temperature, k)
+qa = make_chain(
+    groq_api_key=st.session_state["GROQ_API_KEY"],
+    model=model,
+    temperature=temperature,
+    k=k,
+)
+
+if "messages" not in st.session_state:
+    st.session_state["messages"] = [{"role": "assistant", "content": "Xin chào! Hỏi gì về CTĐT UIT 2025?"}]
 
 for m in st.session_state["messages"]:
     with st.chat_message(m["role"]):
@@ -75,11 +60,7 @@ if prompt:
         st.write(prompt)
     with st.chat_message("assistant"):
         with st.spinner("Đang truy xuất & tổng hợp..."):
-            out = service.qa(prompt, thread_id=st.session_state["thread_id"])
-            ai_text = ""
-            for msg in reversed(out.get("messages", [])):
-                if getattr(msg, "type", "") == "ai":
-                    ai_text = msg.content if isinstance(msg.content, str) else ""
-                    break
-            st.markdown(ai_text or "Mình chưa nhận được câu trả lời hợp lệ.")
-    st.session_state["messages"].append({"role": "assistant", "content": ai_text or "Mình chưa nhận được câu trả lời hợp lệ."})
+            out = qa(prompt)
+            answer = out["messages"][-1].content
+            st.markdown(answer)
+    st.session_state["messages"].append({"role": "assistant", "content": answer})
