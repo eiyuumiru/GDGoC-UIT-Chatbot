@@ -53,6 +53,10 @@ def build_index(
     enforce_max: int = 850,
     overlap: int = 120,
     batch_size: int = 64,
+    min_chunk_chars: int = 320,
+    soft_merge_chars: int = 160,
+    prefix_headers: bool = True,
+    clear_existing: bool = True,
 ) -> Dict[str, Any]:
     
     print("Phase 1/3: load docs ...", flush=True)
@@ -67,10 +71,13 @@ def build_index(
         enforce_max=enforce_max,
         overlap=overlap,
         show_progress=True,
+        min_chunk_chars=min_chunk_chars,
+        soft_merge_chars=soft_merge_chars,
+        prefix_headers=prefix_headers,
     )
     print(f"Chunks: {len(chunks)}", flush=True)
     print("Phase 3/3: build index ...", flush=True)
-    db = build_vec(chunks, enc, batch_size=batch_size, show_progress=True)
+    db = build_vec(chunks, enc, batch_size=batch_size, show_progress=True, clear_existing=clear_existing)
     _refresh_caches(db=db, enc=enc)
     count = getattr(db._collection, "count")() if hasattr(db, "_collection") else None
     return {"docs": len(docs), "chunks": len(chunks), "count": count}
@@ -103,7 +110,19 @@ def retrieve(query: str) -> tuple[str, List[Dict[str, Any]]]:
     cand_docs = ret.invoke(query)
 
     ranked = _RERANKER.rerank(query, cand_docs, topn=k)
-    
+
+    print(f"[retrieve] query: {query}", flush=True)
+    print(f"[retrieve] top_k: {k} | initial_k: {k_init} | candidates: {len(cand_docs)}", flush=True)
+    for idx, (doc, score) in enumerate(ranked, start=1):
+        chunk_text = (doc.page_content or "").strip().replace("\n", " ")
+        if len(chunk_text) > 300:
+            chunk_text = chunk_text[:300].rstrip() + "..."
+        source = doc.metadata.get("source", "")
+        print(
+            f"[retrieve] #{idx} score={float(score):.4f} source={source} chunk={chunk_text}",
+            flush=True,
+        )
+
     results = []
     for d, score in ranked:
         results.append({
