@@ -5,7 +5,7 @@ from langchain_experimental.text_splitter import SemanticChunker
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from tqdm import tqdm
 
-from .ProcessingData import build_header_path, normalize_structured_text
+from .ProcessingData import build_header_path, normalize_structured_text, parse_course_catalog
 
 
 def _merge_segments(pieces: List[str], min_chars: int, soft_chars: int) -> List[str]:
@@ -52,6 +52,39 @@ def split_markdown(
     header_split = MarkdownHeaderTextSplitter(headers_to_split_on=list(headers), strip_headers=False)
     sections: List[Document] = []
     for d in docs:
+        source_path = str((d.metadata or {}).get("source", "")).replace("\\", "/").lower()
+        if source_path.endswith("courses.md"):
+            course_records = parse_course_catalog(d.page_content)
+            for record in course_records:
+                meta = dict(d.metadata or {})
+                title_parts: List[str] = []
+                if record.get("code"):
+                    title_parts.append(record["code"])
+                if record.get("name"):
+                    title_parts.append(record["name"])
+                title = " - ".join(title_parts) if title_parts else f"Mon hoc {record['index']}"
+                summary_text = " ".join((record.get("summary") or "").split())
+                if not summary_text:
+                    summary_text = "Thong tin dang cap nhat."
+                lines = []
+                if record.get("code"):
+                    lines.append(f"Ma mon: {record['code']}")
+                if record.get("name"):
+                    lines.append(f"Ten mon: {record['name']}")
+                lines.append(f"Tom tat: {summary_text}")
+                meta.update(
+                    {
+                        "h1": "Danh sach mon hoc",
+                        "h2": title,
+                        "course_index": record.get("index"),
+                        "course_code": record.get("code"),
+                        "course_name": record.get("name"),
+                        "course_summary": record.get("summary"),
+                        "is_course_entry": True,
+                    }
+                )
+                sections.append(Document(page_content="\n".join(lines), metadata=meta))
+            continue
         parts = header_split.split_text(d.page_content)
         for p in parts:
             meta = dict(d.metadata)
@@ -78,7 +111,10 @@ def split_markdown(
     index = 0
     for sec in sections:
         header_path = build_header_path(sec.metadata or {})
-        pieces = sem.split_text(sec.page_content)
+        if (sec.metadata or {}).get("is_course_entry"):
+            pieces = [sec.page_content]
+        else:
+            pieces = sem.split_text(sec.page_content)
         merged = _merge_segments(pieces, min_chunk_chars, soft_merge_chars)
         for body in merged:
             text = body.strip()

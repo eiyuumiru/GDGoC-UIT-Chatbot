@@ -89,10 +89,11 @@ def search(query: str, k: int = 4, mode: str = "dense") -> List[Document]:
     if _DB is None:
         raise RuntimeError("Vector DB not loaded")
     if mode == "hybrid":
-        k_init = max(30, k * 4)
-        ret = make_hybrid_retriever(_CHUNKS_FOR_BM25, _DB, k=k_init, weights=(0.6, 0.4))
-    else:
-        ret = _DB.as_retriever(search_kwargs={"k": k})
+        retriever = make_hybrid_retriever(_CHUNKS_FOR_BM25, _DB, k=k, weights=(0.6, 0.4))
+        pool = max(40, k * 4)
+        candidates = retriever.gather(query, fetch_k=pool)
+        return [cand.doc for cand in candidates[:k]]
+    ret = _DB.as_retriever(search_kwargs={"k": k})
     return ret.invoke(query)
 
 @tool(response_format='content_and_artifact')
@@ -106,30 +107,60 @@ def retrieve(query: str) -> tuple[str, List[Dict[str, Any]]]:
         raise RuntimeError("Reranker not initialized")
     k_init = max(60, k * 6)
     weights = (0.3, 0.7)
-    ret = make_hybrid_retriever(_CHUNKS_FOR_BM25, _DB, k=k_init, weights=weights)
-    cand_docs = ret.invoke(query)
+    retriever = make_hybrid_retriever(
+        _CHUNKS_FOR_BM25,
+        _DB,
+        k=k,
+        weights=weights,
+        pool_multiplier=5.0,
+        term_weight=0.4,
+    )
+    candidates = retriever.gather(query, fetch_k=k_init)
+    candidate_docs = [cand.doc for cand in candidates]
 
-    ranked = _RERANKER.rerank(query, cand_docs, topn=k)
+    if not candidates:
+        fallback = _DB.as_retriever(search_kwargs={"k": k_init}).invoke(query)
+        candidate_docs = list(fallback)
+        ranked = _RERANKER.rerank(query, candidate_docs, topn=k)
+    else:
+        ranked = _RERANKER.rerank(query, candidates, topn=k)
+        if not ranked and candidate_docs:
+            ranked = _RERANKER.rerank(query, candidate_docs, topn=k)
+
+    if not ranked:
+        ranked = [(doc, 0.0) for doc in candidate_docs[:k]]
 
     print(f"[retrieve] query: {query}", flush=True)
-    print(f"[retrieve] top_k: {k} | initial_k: {k_init} | candidates: {len(cand_docs)}", flush=True)
+    print(f"[retrieve] top_k: {k} | initial_k: {k_init} | candidates: {len(candidate_docs)}", flush=True)
     for idx, (doc, score) in enumerate(ranked, start=1):
         chunk_text = (doc.page_content or "").strip().replace("\n", " ")
         if len(chunk_text) > 300:
             chunk_text = chunk_text[:300].rstrip() + "..."
         source = doc.metadata.get("source", "")
+        rerank_info = (doc.metadata or {}).get("_rerank", {})
+        extra = ""
+        if rerank_info:
+            extra = (
+                f" | ce={float(rerank_info.get('cross_encoder', 0.0)):.3f}"
+                f" | coarse={float(rerank_info.get('coarse_norm', 0.0)):.3f}"
+                f" | hits={rerank_info.get('term_hits', 0)}"
+            )
         print(
-            f"[retrieve] #{idx} score={float(score):.4f} source={source} chunk={chunk_text}",
+            f"[retrieve] #{idx} score={float(score):.4f} source={source}{extra} chunk={chunk_text}",
             flush=True,
         )
 
     results = []
-    for d, score in ranked:
-        results.append({
-            "source": d.metadata.get("source", ""),
+    for doc, score in ranked:
+        record = {
+            "source": doc.metadata.get("source", ""),
             "score": float(score),
-            "content": d.page_content
-        })
+            "content": doc.page_content,
+        }
+        rerank_info = (doc.metadata or {}).get("_rerank")
+        if rerank_info:
+            record["rerank"] = rerank_info
+        results.append(record)
     return query, results
 
 
@@ -141,15 +172,25 @@ class ContextFormatter:
 
     def _normalize_text(self, piece: str) -> str:
         """
-        Chuẩn hóa văn bản mô tả: gom dòng, bỏ ký tự thừa,
-        chuyển thành bullet list nếu có dấu chấm phẩy hoặc 'o '.
+        Chu��cn hA3a v��n b���n mA' t���: gom dA�ng, b��? kA� t��� th���a,
+        chuy���n thA�nh bullet list n���u cA3 d���u ch���m ph��cy ho���c 'o '.
         """
-        text = re.sub(r"\s+", " ", piece).strip()
+        raw = (piece or "").strip()
+        if not raw:
+            return ""
+        if "\n" in raw:
+            lines = [re.sub(r"\s+", " ", line).strip() for line in raw.splitlines() if line.strip()]
+            if lines and all(((":" in line) and line.index(":") <= 24) for line in lines):
+                return "\n".join(f"- {line}" for line in lines)
+            text = " ".join(lines)
+        else:
+            text = re.sub(r"\s+", " ", raw).strip()
 
         if "; " in text or " o " in text:
             parts = re.split(r";|\so\s", text)
             parts = [p.strip(" .") for p in parts if p.strip()]
-            return "\n".join(f"- {p}" for p in parts)
+            if parts:
+                return "\n".join(f"- {p}" for p in parts)
         return text
 
     def _normalize_table(self, piece: str) -> str:

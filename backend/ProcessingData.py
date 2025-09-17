@@ -49,6 +49,49 @@ def parse_table_block(lines: List[str]) -> Optional[List[str]]:
     return records or None
 
 
+
+def parse_course_catalog(text: str) -> List[Dict[str, str]]:
+    lines = text.splitlines()
+    rows: List[List[str]] = []
+    for line in lines:
+        if "|" not in line:
+            continue
+        if re.fullmatch(r"\s*[-:|]+\s*", line):
+            continue
+        cells = [clean_cell(cell) for cell in line.strip().strip("|").split("|")]
+        if not any(cell.strip() for cell in cells):
+            continue
+        rows.append(cells)
+    if not rows:
+        return []
+    first_cell = rows[0][0].strip().lower() if rows[0] else ""
+    has_header = bool(first_cell) and not first_cell.isdigit()
+    body_rows = rows[1:] if has_header else rows
+    records: List[Dict[str, str]] = []
+    for idx, row in enumerate(body_rows):
+        cells = [cell.strip() for cell in row]
+        if len(cells) < 3:
+            continue
+        if len(cells) > 4:
+            base = cells[:3]
+            summary = " ".join(part for part in cells[3:] if part)
+            cells = base + [summary]
+        elif len(cells) < 4:
+            cells = cells + [""] * (4 - len(cells))
+        order, code, name, summary = cells[:4]
+        summary = re.sub(r"\s+", " ", summary).strip()
+        if not code and not name and not summary:
+            continue
+        records.append(
+            {
+                "index": order.strip() or str(idx + 1),
+                "code": code.strip(),
+                "name": name.strip(),
+                "summary": summary,
+            }
+        )
+    return records
+
 def normalize_structured_text(text: str) -> str:
     lines = text.splitlines()
     buffer: List[str] = []
@@ -79,5 +122,6 @@ __all__ = [
     "build_header_path",
     "clean_cell",
     "parse_table_block",
+    "parse_course_catalog",
     "normalize_structured_text",
 ]
