@@ -14,12 +14,24 @@ def build_index(
     collection_name: str = COLLECTION,
     batch_size: int = 64,
     show_progress: bool = True,
+    clear_existing: bool = True,
 ) -> Chroma:
     db = Chroma(
         embedding_function=encoder,
         persist_directory=persist_directory,
         collection_name=collection_name,
     )
+
+    if clear_existing:
+        try:
+            db.delete_collection()
+        except Exception:
+            pass
+        db = Chroma(
+            embedding_function=encoder,
+            persist_directory=persist_directory,
+            collection_name=collection_name,
+        )
 
     total = len(chunks)
     if total == 0:

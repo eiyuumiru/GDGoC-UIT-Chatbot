@@ -4,8 +4,8 @@ from langgraph.constants import END, START
 from langgraph.graph import MessagesState, StateGraph
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.prebuilt import ToolNode, tools_condition
-from langgraph.store.memory import InMemoryStore
 from langchain_core.prompts import ChatPromptTemplate
+from langgraph.checkpoint.memory import MemorySaver
 from .FullChain import retrieve, _ensure_loaded, ContextFormatter
 from .EmbeddingManager import get_encoder
 from langchain_groq import ChatGroq
@@ -14,10 +14,12 @@ import os
 SYSTEM_INSTRUCTIONS = (
     "Bạn là trợ lý trả lời về Chương Trình Đào Tạo UIT (Khóa 2025).\n"
     "Nguyên tắc:\n"
-    "• Chỉ dùng thông tin đã được cung cấp trong dữ liệu tham chiếu (nếu có). Không bịa.\n"
-    "• Nếu dữ liệu chưa đủ để kết luận, nói ngắn gọn rằng chưa đủ và gợi ý cách hỏi cụ thể hơn.\n"
-    "• Trả lời tiếng Việt chuẩn, ngắn gọn, mạch lạc; có thể dùng gạch đầu dòng khi phù hợp.\n"
-    "• Không đề cập đến quy trình nội bộ, công cụ hay cách bạn có dữ liệu.\n"
+    "• Suy luận từng bước một cách logic trong tâm trí, nhưng chỉ trả lời kết quả cuối cùng.\n"
+    "• Chỉ dùng thông tin đã được cung cấp trong dữ liệu tham chiếu và lịch sử hội thoại.\n"
+    "• Phân tích câu hỏi để xác định thông tin cần thiết (môn học, ngành, học kỳ, tín chỉ...).\n"
+    "• Nếu dữ liệu chưa đủ, giải thích ngắn gọn thiếu gì và gợi ý cách hỏi cụ thể.\n"
+    "• Trả lời tiếng Việt chuẩn, ngắn gọn, rõ ràng với gạch đầu dòng khi phù hợp.\n"
+    "• Không đề cập đến quy trình nội bộ, công cụ hay quá trình suy luận.\n"
 )
 
 ANSWER_PROMPT = ChatPromptTemplate.from_messages(
@@ -25,21 +27,23 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages(
         ("system", SYSTEM_INSTRUCTIONS),
         (
             "human",
-            "Câu hỏi: {question}\n\n"
+            "Lịch sử hội thoại gần đây:\n{history}\n\n"
+            "Câu hỏi hiện tại: {question}\n\n"
             "Dữ liệu tham chiếu (có thể trống):\n"
             "----------------\n"
             "{contexts}\n"
             "----------------\n\n"
-            "Yêu cầu: Dựa vào dữ liệu trên để trả lời ngắn gọn, rõ ràng. "
-            "Nếu dữ liệu không đủ, hãy nói rằng chưa đủ thông tin và gợi ý cách hỏi cụ thể hơn."
+            "Hãy suy luận từng bước trong tâm trí:\n"
+            "1. Phân tích câu hỏi để xác định thông tin cần tìm\n"
+            "2. Kiểm tra dữ liệu tham chiếu và lịch sử có đủ thông tin không\n"
+            "3. Đưa ra câu trả lời ngắn gọn, rõ ràng dựa trên phân tích\n\n"
+            "Chỉ trả lời kết quả cuối cùng, không mô tả quá trình suy luận."
         ),
     ]
 )
 
 def _collect_tool_chunks_from_state(state: MessagesState) -> List[Dict[str, Any]]:
-    """Lấy artifact từ các ToolMessage gần nhất, scan ngắn gọn."""
     chunks: List[Dict[str, Any]] = []
-    # chỉ scan các ToolMessage gần nhất (reversed)
     for msg in reversed(state["messages"]):
         if getattr(msg, "type", None) != "tool":
             break
@@ -49,7 +53,7 @@ def _collect_tool_chunks_from_state(state: MessagesState) -> List[Dict[str, Any]
                 content = c.get("content", "").strip()
                 if content:
                     chunks.append(c)
-    return chunks[::-1]  # giữ thứ tự thời gian
+    return chunks[::-1]
 
 def _get_last_user_question(state: MessagesState) -> str:
     for m in reversed(state["messages"]):
@@ -57,40 +61,57 @@ def _get_last_user_question(state: MessagesState) -> str:
             return str(m.content or "")
     return ""
 
+def _format_recent_history(state: MessagesState, max_chars: int = 2000, max_turns: int = 6) -> str:
+    buf = []
+    for m in state["messages"]:
+        if m.type in ("human", "ai"):
+            role = "Người dùng" if m.type == "human" else "Trợ lý"
+            text = str(m.content or "").strip()
+            if text:
+                buf.append(f"{role}: {text}")
+    if not buf:
+        return ""
+    tail = buf[-(max_turns*2):]
+    joined = []
+    total = 0
+    for t in tail:
+        if total + len(t) > max_chars:
+            break
+        joined.append(t)
+        total += len(t)
+    return "\n".join(joined)
+
 class LLMService(ContextFormatter):
     def __init__(self, groq_api_key: Optional[str] = None, model: str = "llama-3.3-70b-versatile", temperature: float = 0.2, max_tokens: Optional[int] = None):
         _ensure_loaded()
         super().__init__()
-        self.llm = self.__init_LLM(groq_api_key=groq_api_key, model=model, temperature=temperature, max_tokens=max_tokens)
-        self.encoder = self.__init_Encoder()
-        self.store = self.__init_Storage()
-        self.graph = self.__init_Graph()
+        self.llm = self.LLM(groq_api_key=groq_api_key, model=model, temperature=temperature, max_tokens=max_tokens)
+        self.encoder = self.Encoder()
+        self.memory = self.Memory()
+        self.graph = self.Graph()
 
-    def __init_LLM(self, groq_api_key: Optional[str] = None, model: str = "llama-3.3-70b-versatile", temperature: float = 0.2, max_tokens: Optional[int] = None) -> ChatGroq:
+    def LLM(self, groq_api_key: Optional[str] = None, model: str = "llama-3.3-70b-versatile", temperature: float = 0.2, max_tokens: Optional[int] = None) -> ChatGroq:
         key = groq_api_key or os.getenv("GROQ_API_KEY")
         if not key:
             raise ValueError("Thiếu GROQ_API_KEY")
         return ChatGroq(model=model, temperature=temperature, max_tokens=max_tokens)
     
-    def __init_Encoder(self):
+    def Encoder(self):
         return get_encoder()
     
-    def __init_Storage(self):
-        return InMemoryStore(
-            index={
-                "dims": 1536,
-                "embed": self.encoder
-            }
-        )
+    def Memory(self):
+        return MemorySaver()
     
     def query_or_response(self, state: MessagesState):
-        """Node 1: Cho phép LLM quyết định có cần tool."""
         planner_system = SystemMessage(
             content=(
-                "Bạn là một trợ lý thông minh cho CTĐT UIT. "
-                "Nếu câu hỏi cần chi tiết cụ thể từ dữ liệu chương trình (môn học, tín chỉ, học kỳ, điều kiện, quy định...), "
-                "hãy gọi công cụ 'retrieve' với truy vấn ngắn gọn tiếng Việt. "
-                "Nếu có thể trả lời ngay, đừng gọi công cụ."
+                "Bạn là trợ lý phân tích câu hỏi về CTĐT UIT. "
+                "Suy luận trong tâm trí: "
+                "1. Câu hỏi này cần thông tin cụ thể nào? "
+                "2. Lịch sử hội thoại có đủ ngữ cảnh không? "
+                "3. Nếu cần dữ liệu chi tiết từ chương trình đào tạo, gọi 'retrieve'. "
+                "4. Nếu có thể trả lời từ kiến thức chung, không cần gọi công cụ. "
+                "Quyết định ngay, không giải thích quá trình."
             )
         )
         llm_with_tools = self.llm.bind_tools([retrieve])
@@ -98,14 +119,14 @@ class LLMService(ContextFormatter):
         return {"messages": [response]}
     
     def generate_with_context(self, state: MessagesState):
-        """Node 2: Sau khi (có thể) đã gọi tool, tổng hợp trả lời bằng PromptTemplate."""
         chunks = _collect_tool_chunks_from_state(state)
         contexts = self.format_context(chunks)
-        messages = ANSWER_PROMPT.format_messages(question=_get_last_user_question(state), contexts=contexts)
+        history = _format_recent_history(state)
+        messages = ANSWER_PROMPT.format_messages(question=_get_last_user_question(state), contexts=contexts, history=history)
         out = self.llm.invoke(messages)
         return {"messages": [out]}
 
-    def __init_Graph(self):
+    def Graph(self):
         tools = ToolNode([retrieve])
         graph_builder = StateGraph(MessagesState)
         graph_builder.add_node("query_or_response", self.query_or_response)
@@ -115,12 +136,8 @@ class LLMService(ContextFormatter):
         graph_builder.add_conditional_edges("query_or_response", tools_condition, {END: END, "tools": "tools"})
         graph_builder.add_edge("tools", "generate_with_context")
         graph_builder.add_edge("generate_with_context", END)
-        return graph_builder.compile()
-    
-    def visualize(self, filename: str = "llm_service_graph"):
-        bytes = self.graph.get_graph().draw_mermaid_png()
-        with open(f"{filename}.png", "wb") as f:
-            f.write(bytes)
+        return graph_builder.compile(checkpointer=self.memory)
 
-    def __call__(self, question: str, topk: Optional[int] = None) -> Any:
-        return self.graph.invoke({"messages": [HumanMessage(content=question)]})
+    def __call__(self, question: str, thread_id: str = "default_session", topk: Optional[int] = None) -> Any:
+        config = {"configurable": {"thread_id": thread_id}}
+        return self.graph.invoke({"messages": [HumanMessage(content=question)]}, config=config)

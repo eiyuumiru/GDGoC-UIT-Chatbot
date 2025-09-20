@@ -31,5 +31,5 @@ Thumbs.db
 
 *.toml
 .streamlit/
-backend/.index/
+backend/.index*/
 tmp_*.py
