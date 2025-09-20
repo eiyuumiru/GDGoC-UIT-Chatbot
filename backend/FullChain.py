@@ -100,6 +100,7 @@ def search(query: str, k: int = 4, mode: str = "dense") -> List[Document]:
 def retrieve(query: str) -> tuple[str, List[Dict[str, Any]]]:
     """Retrieve information about UIT's academic curriculum (majors, courses, credits, and regulations) from the internal vector database."""
     _ensure_loaded()
+    print("Calling retrieve tool", flush=True)
     k = 6
     if _CHUNKS_FOR_BM25 is None:
         raise RuntimeError("BM25 chunks not loaded")
@@ -154,7 +155,6 @@ def retrieve(query: str) -> tuple[str, List[Dict[str, Any]]]:
     for doc, score in ranked:
         record = {
             "source": doc.metadata.get("source", ""),
-            "score": float(score),
             "content": doc.page_content,
         }
         rerank_info = (doc.metadata or {}).get("_rerank")
@@ -163,18 +163,12 @@ def retrieve(query: str) -> tuple[str, List[Dict[str, Any]]]:
         results.append(record)
     return query, results
 
-
-
 class ContextFormatter:
     def __init__(self, max_chars: int = 8000, max_items: int = 6):
         self.max_chars = max_chars
         self.max_items = max_items
 
     def _normalize_text(self, piece: str) -> str:
-        """
-        Chu��cn hA3a v��n b���n mA' t���: gom dA�ng, b��? kA� t��� th���a,
-        chuy���n thA�nh bullet list n���u cA3 d���u ch���m ph��cy ho���c 'o '.
-        """
         raw = (piece or "").strip()
         if not raw:
             return ""
@@ -194,9 +188,6 @@ class ContextFormatter:
         return text
 
     def _normalize_table(self, piece: str) -> str:
-        """
-        Chuẩn hóa context dạng bảng môn học sang bảng markdown.
-        """
         rows = []
         text = re.sub(r"\s+", " ", piece.replace("|", " "))
 
